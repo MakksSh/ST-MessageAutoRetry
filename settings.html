@@ -1,0 +1,20 @@
+<div id="st-message-auto-retry-settings" class="inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+        <b>ST Message Auto Retry</b>
+        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+
+    <div class="inline-drawer-content">
+        <div class="flex-container">
+            <input id="st_message_auto_retry_enabled" type="checkbox" />
+            <label for="st_message_auto_retry_enabled">Enable auto retry</label>
+        </div>
+
+        <div class="flex-container">
+            <label for="st_message_auto_retry_delay">Retry delay in seconds</label>
+            <input id="st_message_auto_retry_delay" type="number" min="0" step="1" class="text_pole" style="width: 120px;" />
+        </div>
+
+        <p><small>Retries generation requests once when the server responds with HTTP 429.</small></p>
+    </div>
+</div>
