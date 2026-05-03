@@ -115,6 +115,20 @@ function createRetryRequest(request) {
     return new Request(request, { headers });
 }
 
+function createRetryArgs(originalArgs, replayableRequest) {
+    const [input, init] = originalArgs;
+
+    if (typeof input === "string") {
+        const nextInit = { ...(init ?? {}) };
+        const headers = new Headers(nextInit.headers ?? replayableRequest.headers);
+        headers.set(retryHeaderName, "1");
+        nextInit.headers = headers;
+        return [input, nextInit];
+    }
+
+    return [createRetryRequest(replayableRequest.clone())];
+}
+
 function updateSetting(key, value) {
     extension_settings[extensionName][key] = value;
     saveSettingsDebounced();
@@ -154,7 +168,7 @@ async function loadSettingsUi() {
     $("#extensions_settings2").append(settingsHtml);
 }
 
-async function handleRetry(response, replayableRequest) {
+async function handleRetry(response, replayableRequest, originalFetch, thisArg, originalArgs) {
     const settings = extension_settings[extensionName] ?? defaultSettings;
 
     if (!settings.enabled || response.status !== 429) {
@@ -181,8 +195,8 @@ async function handleRetry(response, replayableRequest) {
         showRetryToast(delayMs / 1000, attemptNumber);
 
         try {
-            const retryRequest = createRetryRequest(replayableRequest.clone());
-            currentResponse = await window.__st_message_auto_retry_original_fetch__.call(window, retryRequest);
+            const retryArgs = createRetryArgs(originalArgs, replayableRequest);
+            currentResponse = await originalFetch.apply(thisArg, retryArgs);
             attemptNumber += 1;
         } catch (error) {
             console.warn(`[${extensionName}] Retry failed.`, error);
@@ -214,9 +228,8 @@ function installFetchInterceptor() {
             return window.__st_message_auto_retry_original_fetch__.apply(this, args);
         }
 
-        const firstAttempt = replayableRequest.clone();
-        const response = await window.__st_message_auto_retry_original_fetch__.call(this, firstAttempt);
-        return handleRetry(response, replayableRequest);
+        const response = await window.__st_message_auto_retry_original_fetch__.apply(this, args);
+        return handleRetry(response, replayableRequest, window.__st_message_auto_retry_original_fetch__, this, args);
     };
 }
 
