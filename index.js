@@ -123,8 +123,11 @@ function isPotentialGenerationRequest(url, method) {
 }
 
 function getDelayMs() {
-    const seconds = Number(extension_settings[extensionName]?.retryDelaySeconds ?? defaultSettings.retryDelaySeconds);
-    return Math.max(0, seconds) * 1000;
+    const rawSeconds = Number(extension_settings[extensionName]?.retryDelaySeconds);
+    const normalizedSeconds = Number.isFinite(rawSeconds) && rawSeconds >= 0
+        ? rawSeconds
+        : defaultSettings.retryDelaySeconds;
+    return normalizedSeconds * 1000;
 }
 
 function getMaxDebugLogs() {
@@ -145,8 +148,12 @@ function showRetryToast(seconds, attemptNumber) {
         return;
     }
 
+    const message = seconds > 0
+        ? `Retry attempt ${attemptNumber} will start in ${seconds} second${seconds === 1 ? "" : "s"}.`
+        : `Retry attempt ${attemptNumber} is starting now.`;
+
     toastr.info(
-        `Retry attempt ${attemptNumber} is starting after ${seconds} second${seconds === 1 ? "" : "s"}.`,
+        message,
         extensionTitle,
         { preventDuplicates: true },
     );
@@ -423,8 +430,15 @@ function formatDebugLogEntry(logEntry) {
         `requestId: ${logEntry.requestId} | matched: ${logEntry.isGenerationRequest ? `yes (${logEntry.matchedBy})` : "no"} | shape: ${logEntry.inputShape}`,
     ];
 
+    if (typeof logEntry.effectiveDelayMs === "number") {
+        lines.push(`effective delay: ${logEntry.effectiveDelayMs}ms`);
+    }
+
     for (const attempt of logEntry.attempts ?? []) {
         lines.push(`attempt ${attempt.attempt} (${attempt.phase}): status=${attempt.responseStatus} ok=${attempt.responseOk} type=${attempt.contentType || "[none]"}`);
+        if (attempt.retryScheduledAt || attempt.retryStartedAt) {
+            lines.push(`retry timing: scheduled=${formatTimestamp(attempt.retryScheduledAt)} | started=${formatTimestamp(attempt.retryStartedAt)}`);
+        }
         if (attempt.bodyHas429Signal) {
             lines.push("body signal: detected 429-like content");
         }
@@ -568,7 +582,7 @@ function buildSkippedTrace(trace, reason) {
     };
 }
 
-async function recordAttempt(trace, response, phase, attemptNumber, retryTriggered, retryReason, responseDetails = null) {
+async function recordAttempt(trace, response, phase, attemptNumber, retryTriggered, retryReason, responseDetails = null, extraFields = {}) {
     const details = responseDetails ?? await inspectResponse(response);
     trace.attempts.push({
         attempt: attemptNumber,
@@ -576,6 +590,7 @@ async function recordAttempt(trace, response, phase, attemptNumber, retryTrigger
         ...details,
         retryTriggered,
         retryReason,
+        ...extraFields,
     });
 
     return details;
@@ -607,6 +622,7 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
     }
 
     const delayMs = getDelayMs();
+    trace.effectiveDelayMs = delayMs;
     let currentResponse = response;
     let attemptNumber = 1;
 
@@ -619,9 +635,14 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
             return currentResponse;
         }
 
+        const retryScheduledAt = new Date().toISOString();
+        showRetryToast(delayMs / 1000, attemptNumber);
+
         if (delayMs > 0) {
             await sleep(delayMs);
         }
+
+        const retryStartedAt = new Date().toISOString();
 
         if (replayableRequest.signal?.aborted) {
             trace.requestAborted = true;
@@ -631,8 +652,6 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
             return currentResponse;
         }
 
-        showRetryToast(delayMs / 1000, attemptNumber);
-
         try {
             const retryArgs = createRetryArgs(originalArgs, replayableRequest);
             currentResponse = await originalFetch.apply(thisArg, retryArgs);
@@ -640,7 +659,10 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
             const retryDetails = shouldInspectRetryResponse ? await inspectResponse(currentResponse) : null;
             const retryDecision = shouldRetryResponse(currentResponse, retryDetails);
             if (shouldLog) {
-                await recordAttempt(trace, currentResponse, "retry", attemptNumber, retryDecision.shouldRetry, retryDecision.reason, retryDetails);
+                await recordAttempt(trace, currentResponse, "retry", attemptNumber, retryDecision.shouldRetry, retryDecision.reason, retryDetails, {
+                    retryScheduledAt,
+                    retryStartedAt,
+                });
             }
             attemptNumber += 1;
 
