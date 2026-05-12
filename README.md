@@ -24,7 +24,8 @@ Automatically retries generation requests until SillyTavern receives a non-429 r
 
 - Intercepts only generation requests that currently match `/generate` and `/chat/completions`.
 - If a generation request returns HTTP 429 and auto retry is enabled, the extension waits the configured delay, shows a toast when each retry starts, and resends the same request.
-- The extension keeps retrying while the response remains HTTP 429.
+- The extension also retries 5xx responses when the response body clearly indicates an upstream 429 or quota exhaustion payload.
+- The extension keeps retrying while the response remains HTTP 429, or while a 5xx response still carries that 429-like payload.
 - Debug mode records the request URL, route-match decision, HTTP status, content type, compact body preview, and final retry decision.
 
 ## Debug notes

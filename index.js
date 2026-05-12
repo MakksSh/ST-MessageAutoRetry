@@ -487,6 +487,27 @@ function detect429Signal(text) {
         || normalized.includes("resource has been exhausted");
 }
 
+function shouldRetryResponse(response, responseDetails = null) {
+    if (response.status === 429) {
+        return {
+            shouldRetry: true,
+            reason: "http_429",
+        };
+    }
+
+    if (response.status >= 500 && response.status < 600 && responseDetails?.bodyHas429Signal) {
+        return {
+            shouldRetry: true,
+            reason: `http_${response.status}_with_429_payload`,
+        };
+    }
+
+    return {
+        shouldRetry: false,
+        reason: `http_status_${response.status}`,
+    };
+}
+
 function sanitizePreview(text) {
     if (typeof text !== "string" || !text.length) {
         return "";
@@ -547,8 +568,8 @@ function buildSkippedTrace(trace, reason) {
     };
 }
 
-async function recordAttempt(trace, response, phase, attemptNumber, retryTriggered, retryReason) {
-    const details = await inspectResponse(response);
+async function recordAttempt(trace, response, phase, attemptNumber, retryTriggered, retryReason, responseDetails = null) {
+    const details = responseDetails ?? await inspectResponse(response);
     trace.attempts.push({
         attempt: attemptNumber,
         phase,
@@ -556,6 +577,8 @@ async function recordAttempt(trace, response, phase, attemptNumber, retryTrigger
         retryTriggered,
         retryReason,
     });
+
+    return details;
 }
 
 function commitTrace(trace, shouldLog) {
@@ -566,12 +589,15 @@ function commitTrace(trace, shouldLog) {
 
 async function handleRetry(response, replayableRequest, originalFetch, thisArg, originalArgs, trace, shouldLog) {
     const settings = extension_settings[extensionName] ?? defaultSettings;
-    const initialShouldRetry = settings.enabled && response.status === 429;
+    const shouldInspectInitialResponse = shouldLog || (settings.enabled && response.status >= 500 && response.status < 600);
+    const initialDetails = shouldInspectInitialResponse ? await inspectResponse(response) : null;
+    const initialRetryDecision = shouldRetryResponse(response, initialDetails);
+    const initialShouldRetry = settings.enabled && initialRetryDecision.shouldRetry;
     if (shouldLog) {
-        await recordAttempt(trace, response, "initial", 0, initialShouldRetry, initialShouldRetry ? "http_429" : `http_status_${response.status}`);
+        await recordAttempt(trace, response, "initial", 0, initialShouldRetry, initialRetryDecision.reason, initialDetails);
     }
 
-    if (!settings.enabled || response.status !== 429) {
+    if (!settings.enabled || !initialShouldRetry) {
         if (shouldLog) {
             trace.finalDecision = settings.enabled ? "no_retry" : "disabled";
             trace.finalReason = settings.enabled ? `response_status_${response.status}` : "auto_retry_disabled";
@@ -584,7 +610,7 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
     let currentResponse = response;
     let attemptNumber = 1;
 
-    while (currentResponse.status === 429) {
+    while (true) {
         if (replayableRequest.signal?.aborted) {
             trace.requestAborted = true;
             trace.finalDecision = "stopped";
@@ -610,11 +636,17 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
         try {
             const retryArgs = createRetryArgs(originalArgs, replayableRequest);
             currentResponse = await originalFetch.apply(thisArg, retryArgs);
+            const shouldInspectRetryResponse = shouldLog || currentResponse.status >= 500 && currentResponse.status < 600;
+            const retryDetails = shouldInspectRetryResponse ? await inspectResponse(currentResponse) : null;
+            const retryDecision = shouldRetryResponse(currentResponse, retryDetails);
             if (shouldLog) {
-                const shouldRetryAgain = currentResponse.status === 429;
-                await recordAttempt(trace, currentResponse, "retry", attemptNumber, shouldRetryAgain, shouldRetryAgain ? "http_429" : `http_status_${currentResponse.status}`);
+                await recordAttempt(trace, currentResponse, "retry", attemptNumber, retryDecision.shouldRetry, retryDecision.reason, retryDetails);
             }
             attemptNumber += 1;
+
+            if (!retryDecision.shouldRetry) {
+                break;
+            }
         } catch (error) {
             console.warn(`[${extensionName}] Retry failed.`, error);
             if (shouldLog) {
