@@ -709,7 +709,8 @@ function installFetchInterceptor() {
             }
 
             const settings = extension_settings[extensionName] ?? defaultSettings;
-            if (!settings.enabled || response.status !== 429) {
+            const canContainRetryableQuotaPayload = response.status === 429 || (response.status >= 500 && response.status < 600);
+            if (!settings.enabled || !canContainRetryableQuotaPayload) {
                 return response;
             }
 
