@@ -15,6 +15,38 @@
             <input id="st_message_auto_retry_delay" type="number" min="0" step="1" class="text_pole" style="width: 120px;" />
         </div>
 
-        <p><small>Retries generation requests once when the server responds with HTTP 429.</small></p>
+        <hr class="sysHR" />
+
+        <div class="flex-container">
+            <input id="st_message_auto_retry_debug_enabled" type="checkbox" />
+            <label for="st_message_auto_retry_debug_enabled">Enable debug mode</label>
+        </div>
+
+        <div class="flex-container">
+            <label for="st_message_auto_retry_debug_max_logs">Keep last N logs</label>
+            <input id="st_message_auto_retry_debug_max_logs" type="number" min="1" max="200" step="1" class="text_pole" style="width: 120px;" />
+        </div>
+
+        <div class="flex-container flexFlowColumn alignitemsflexstart" style="gap: 8px; margin-top: 8px;">
+            <div class="flex-container" style="gap: 8px; flex-wrap: wrap;">
+                <button id="st_message_auto_retry_debug_toggle" class="menu_button">Open debug log</button>
+                <button id="st_message_auto_retry_debug_copy" class="menu_button">Copy logs</button>
+                <button id="st_message_auto_retry_debug_clear" class="menu_button">Clear logs</button>
+            </div>
+
+            <small id="st_message_auto_retry_debug_summary">No debug logs captured yet.</small>
+        </div>
+
+        <div id="st_message_auto_retry_debug_panel" style="display: none; margin-top: 10px;">
+            <textarea
+                id="st_message_auto_retry_debug_output"
+                class="text_pole"
+                rows="12"
+                readonly
+                style="width: 100%; resize: vertical; font-family: monospace;"
+            >No debug logs captured yet.</textarea>
+        </div>
+
+        <p><small>Retries generation requests while the browser-visible response stays HTTP 429. Debug mode stores a compact request trace for mobile-friendly diagnostics.</small></p>
     </div>
 </div>

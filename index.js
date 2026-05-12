@@ -5,11 +5,19 @@ const extensionName = "ST-MessageAutoRetry";
 const extensionTitle = "ST Message Auto Retry";
 const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 const retryHeaderName = "X-ST-Message-Auto-Retry";
+const debugStorageKey = `${extensionName}:debugLogs`;
+const maxBodyPreviewLength = 1500;
+const maxClipboardLogCount = 100;
 
 const defaultSettings = {
     enabled: true,
     retryDelaySeconds: 5,
+    debugMode: false,
+    maxDebugLogs: 20,
 };
+
+let requestSequence = 0;
+let debugLogs = loadDebugLogsFromStorage();
 
 function ensureSettings() {
     if (!extension_settings[extensionName]) {
@@ -39,6 +47,19 @@ function ensureSettings() {
         changed = true;
     }
 
+    const normalizedDebugMode = Boolean(settings.debugMode);
+    if (settings.debugMode !== normalizedDebugMode) {
+        settings.debugMode = normalizedDebugMode;
+        changed = true;
+    }
+
+    const maxLogs = Number(settings.maxDebugLogs);
+    const normalizedMaxLogs = Number.isFinite(maxLogs) && maxLogs >= 1 ? Math.min(200, Math.round(maxLogs)) : defaultSettings.maxDebugLogs;
+    if (settings.maxDebugLogs !== normalizedMaxLogs) {
+        settings.maxDebugLogs = normalizedMaxLogs;
+        changed = true;
+    }
+
     return changed;
 }
 
@@ -58,26 +79,61 @@ function getRequestUrl(input) {
     return null;
 }
 
-function isGenerationUrl(url) {
+function getRequestMethod(input, init) {
+    const method = init?.method ?? input?.method;
+    return typeof method === "string" && method.trim() ? method.toUpperCase() : "GET";
+}
+
+function classifyGenerationUrl(url) {
     if (!url) {
-        return false;
+        return { matched: false, matchedBy: null, pathname: null };
     }
 
     try {
         const parsed = new URL(url, window.location.href);
-        return parsed.pathname.endsWith("/generate") || parsed.pathname.endsWith("/chat/completions");
+        const { pathname } = parsed;
+        if (pathname.endsWith("/generate")) {
+            return { matched: true, matchedBy: "/generate", pathname };
+        }
+
+        if (pathname.endsWith("/chat/completions")) {
+            return { matched: true, matchedBy: "/chat/completions", pathname };
+        }
+
+        return { matched: false, matchedBy: null, pathname };
     } catch {
-        return url.includes("/generate") || url.includes("/chat/completions");
+        if (url.includes("/generate")) {
+            return { matched: true, matchedBy: "/generate", pathname: null };
+        }
+
+        if (url.includes("/chat/completions")) {
+            return { matched: true, matchedBy: "/chat/completions", pathname: null };
+        }
+
+        return { matched: false, matchedBy: null, pathname: null };
     }
 }
 
-function isGenerationRequest(input) {
-    return isGenerationUrl(getRequestUrl(input));
+function isPotentialGenerationRequest(url, method) {
+    if (!url || method !== "POST") {
+        return false;
+    }
+
+    return url.includes("/api/backends/") || url.includes("/generate") || url.includes("/completions");
 }
 
 function getDelayMs() {
     const seconds = Number(extension_settings[extensionName]?.retryDelaySeconds ?? defaultSettings.retryDelaySeconds);
     return Math.max(0, seconds) * 1000;
+}
+
+function getMaxDebugLogs() {
+    const maxLogs = Number(extension_settings[extensionName]?.maxDebugLogs ?? defaultSettings.maxDebugLogs);
+    return Number.isFinite(maxLogs) && maxLogs >= 1 ? Math.min(200, Math.round(maxLogs)) : defaultSettings.maxDebugLogs;
+}
+
+function isDebugEnabled() {
+    return Boolean(extension_settings[extensionName]?.debugMode);
 }
 
 function sleep(ms) {
@@ -94,6 +150,15 @@ function showRetryToast(seconds, attemptNumber) {
         extensionTitle,
         { preventDuplicates: true },
     );
+}
+
+function showStatusToast(level, message) {
+    const handler = toastr?.[level];
+    if (typeof handler !== "function") {
+        return;
+    }
+
+    handler(message, extensionTitle, { preventDuplicates: true });
 }
 
 function buildReplayableRequest(args) {
@@ -129,6 +194,23 @@ function createRetryArgs(originalArgs, replayableRequest) {
     return [createRetryRequest(replayableRequest.clone())];
 }
 
+function getInputShape(input) {
+    if (typeof input === "string") {
+        return "string+init";
+    }
+
+    if (isRequestObject(input)) {
+        return "request";
+    }
+
+    return "unknown";
+}
+
+function nextRequestId() {
+    requestSequence += 1;
+    return `mar_${String(requestSequence).padStart(4, "0")}`;
+}
+
 function updateSetting(key, value) {
     extension_settings[extensionName][key] = value;
     saveSettingsDebounced();
@@ -140,6 +222,10 @@ function loadSettings() {
 
     $("#st_message_auto_retry_enabled").prop("checked", settings.enabled);
     $("#st_message_auto_retry_delay").val(settings.retryDelaySeconds);
+    $("#st_message_auto_retry_debug_enabled").prop("checked", settings.debugMode);
+    $("#st_message_auto_retry_debug_max_logs").val(settings.maxDebugLogs);
+
+    renderDebugUi();
 
     if (changed) {
         saveSettingsDebounced();
@@ -157,6 +243,89 @@ function bindSettings() {
             updateSetting("retryDelaySeconds", value);
         }
     });
+
+    $("#st_message_auto_retry_debug_enabled").off("change.stMessageAutoRetry").on("change.stMessageAutoRetry", function () {
+        const enabled = Boolean(this.checked);
+        updateSetting("debugMode", enabled);
+        if (enabled) {
+            appendDebugLog({
+                type: "session_start",
+                ts: new Date().toISOString(),
+                extension: extensionName,
+                settings: {
+                    enabled: Boolean(extension_settings[extensionName]?.enabled),
+                    retryDelaySeconds: Number(extension_settings[extensionName]?.retryDelaySeconds ?? defaultSettings.retryDelaySeconds),
+                    debugMode: true,
+                    maxDebugLogs: getMaxDebugLogs(),
+                },
+            });
+        }
+        renderDebugUi();
+    });
+
+    $("#st_message_auto_retry_debug_max_logs").off("change.stMessageAutoRetry input.stMessageAutoRetry").on("change.stMessageAutoRetry input.stMessageAutoRetry", function () {
+        const value = Number.parseFloat(String(this.value));
+        if (Number.isFinite(value) && value >= 1) {
+            updateSetting("maxDebugLogs", value);
+            trimDebugLogs();
+            renderDebugUi();
+        }
+    });
+
+    $("#st_message_auto_retry_debug_toggle").off("click.stMessageAutoRetry").on("click.stMessageAutoRetry", function () {
+        const panel = $("#st_message_auto_retry_debug_panel");
+        const isVisible = panel.is(":visible");
+        panel.toggle(!isVisible);
+        $(this).text(isVisible ? "Open debug log" : "Hide debug log");
+    });
+
+    $("#st_message_auto_retry_debug_copy").off("click.stMessageAutoRetry").on("click.stMessageAutoRetry", async () => {
+        const rawLogs = debugLogs.slice(-maxClipboardLogCount);
+        const payload = JSON.stringify(rawLogs, null, 2);
+        const copied = await copyTextToClipboard(payload);
+        if (copied) {
+            showStatusToast("success", "Debug logs copied.");
+        } else {
+            showStatusToast("error", "Could not copy debug logs.");
+        }
+    });
+
+    $("#st_message_auto_retry_debug_clear").off("click.stMessageAutoRetry").on("click.stMessageAutoRetry", () => {
+        debugLogs = [];
+        persistDebugLogs();
+        renderDebugUi();
+        showStatusToast("info", "Debug logs cleared.");
+    });
+}
+
+async function copyTextToClipboard(text) {
+    if (navigator?.clipboard?.writeText) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "readonly");
+    textarea.style.position = "fixed";
+    textarea.style.top = "-9999px";
+    document.body.append(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+
+    let copied = false;
+    try {
+        copied = document.execCommand("copy");
+    } catch {
+        copied = false;
+    }
+
+    textarea.remove();
+    return copied;
 }
 
 async function loadSettingsUi() {
@@ -168,10 +337,246 @@ async function loadSettingsUi() {
     $("#extensions_settings2").append(settingsHtml);
 }
 
-async function handleRetry(response, replayableRequest, originalFetch, thisArg, originalArgs) {
+function loadDebugLogsFromStorage() {
+    try {
+        const rawValue = window.localStorage?.getItem(debugStorageKey);
+        if (!rawValue) {
+            return [];
+        }
+
+        const parsed = JSON.parse(rawValue);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function persistDebugLogs() {
+    try {
+        window.localStorage?.setItem(debugStorageKey, JSON.stringify(debugLogs));
+    } catch (error) {
+        console.warn(`[${extensionName}] Could not persist debug logs.`, error);
+    }
+}
+
+function trimDebugLogs() {
+    const maxLogs = getMaxDebugLogs();
+    if (debugLogs.length > maxLogs) {
+        debugLogs = debugLogs.slice(-maxLogs);
+        persistDebugLogs();
+    }
+}
+
+function appendDebugLog(logEntry) {
+    debugLogs.push(logEntry);
+    trimDebugLogs();
+    persistDebugLogs();
+    renderDebugUi();
+}
+
+function renderDebugUi() {
+    const panel = $("#st_message_auto_retry_debug_panel");
+    if (!panel.length) {
+        return;
+    }
+
+    const logCount = debugLogs.length;
+    const lastLog = debugLogs[logCount - 1] ?? null;
+    const summaryLines = [
+        `Logs stored: ${logCount}`,
+        `Debug mode: ${isDebugEnabled() ? "on" : "off"}`,
+    ];
+
+    if (lastLog?.type === "request_trace") {
+        summaryLines.push(`Last decision: ${lastLog.finalDecision} (${lastLog.finalReason})`);
+        const lastAttempt = lastLog.attempts?.[lastLog.attempts.length - 1] ?? null;
+        if (lastAttempt) {
+            summaryLines.push(`Last response: ${lastAttempt.responseStatus} ${lastAttempt.contentType ? `, ${lastAttempt.contentType}` : ""}`);
+        }
+    } else if (lastLog?.type === "session_start") {
+        summaryLines.push("Last event: debug session started");
+    }
+
+    $("#st_message_auto_retry_debug_summary").text(summaryLines.join(" | "));
+    $("#st_message_auto_retry_debug_output").val(formatDebugLogsForDisplay(debugLogs));
+}
+
+function formatDebugLogsForDisplay(logEntries) {
+    if (!logEntries.length) {
+        return "No debug logs captured yet.";
+    }
+
+    return logEntries.map(formatDebugLogEntry).join("\n\n");
+}
+
+function formatDebugLogEntry(logEntry) {
+    if (logEntry.type === "session_start") {
+        return `[${formatTimestamp(logEntry.ts)}] Debug session started | retry=${logEntry.settings?.enabled ? "on" : "off"} | delay=${logEntry.settings?.retryDelaySeconds ?? "?"}s | keep=${logEntry.settings?.maxDebugLogs ?? "?"}`;
+    }
+
+    if (logEntry.type !== "request_trace") {
+        return JSON.stringify(logEntry);
+    }
+
+    const lines = [
+        `[${formatTimestamp(logEntry.ts)}] ${logEntry.method} ${logEntry.url ?? "[unknown url]"}`,
+        `requestId: ${logEntry.requestId} | matched: ${logEntry.isGenerationRequest ? `yes (${logEntry.matchedBy})` : "no"} | shape: ${logEntry.inputShape}`,
+    ];
+
+    for (const attempt of logEntry.attempts ?? []) {
+        lines.push(`attempt ${attempt.attempt} (${attempt.phase}): status=${attempt.responseStatus} ok=${attempt.responseOk} type=${attempt.contentType || "[none]"}`);
+        if (attempt.bodyHas429Signal) {
+            lines.push("body signal: detected 429-like content");
+        }
+        if (attempt.bodyPreview) {
+            lines.push(`body preview: ${attempt.bodyPreview}`);
+        }
+        if (attempt.retryTriggered) {
+            lines.push(`retry: yes (${attempt.retryReason})`);
+        } else if (attempt.retryReason) {
+            lines.push(`retry: no (${attempt.retryReason})`);
+        }
+    }
+
+    if (logEntry.errorMessage) {
+        lines.push(`error: ${logEntry.errorMessage}`);
+    }
+
+    lines.push(`final: ${logEntry.finalDecision} (${logEntry.finalReason})`);
+    return lines.join("\n");
+}
+
+function formatTimestamp(value) {
+    if (!value) {
+        return "unknown time";
+    }
+
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
+}
+
+function buildTrace(args, matchResult) {
+    const [input, init] = args;
+    const url = getRequestUrl(input);
+    return {
+        type: "request_trace",
+        ts: new Date().toISOString(),
+        requestId: nextRequestId(),
+        url,
+        method: getRequestMethod(input, init),
+        inputShape: getInputShape(input),
+        isGenerationRequest: matchResult.matched,
+        matchedBy: matchResult.matchedBy,
+        attempts: [],
+        requestAborted: Boolean(input?.signal?.aborted || init?.signal?.aborted),
+        finalDecision: null,
+        finalReason: null,
+    };
+}
+
+function detect429Signal(text) {
+    if (typeof text !== "string" || !text.trim()) {
+        return false;
+    }
+
+    const normalized = text.toLowerCase();
+    return normalized.includes('"code":429')
+        || normalized.includes('"code": 429')
+        || normalized.includes("too many requests")
+        || normalized.includes("resource_exhausted")
+        || normalized.includes("resource has been exhausted");
+}
+
+function sanitizePreview(text) {
+    if (typeof text !== "string" || !text.length) {
+        return "";
+    }
+
+    const compact = text.replace(/\s+/g, " ").trim();
+    if (compact.length <= maxBodyPreviewLength) {
+        return compact;
+    }
+
+    return `${compact.slice(0, maxBodyPreviewLength)}…`;
+}
+
+async function inspectResponse(response) {
+    const contentType = response.headers.get("content-type") ?? "";
+    const details = {
+        responseStatus: response.status,
+        responseOk: response.ok,
+        contentType,
+        bodyPreview: "",
+        bodyHas429Signal: false,
+        bodyReadError: null,
+    };
+
+    const lowerContentType = contentType.toLowerCase();
+    if (lowerContentType.includes("text/event-stream")) {
+        details.bodyPreview = "[event stream skipped]";
+        return details;
+    }
+
+    const canReadBody = lowerContentType.includes("application/json")
+        || lowerContentType.includes("text/")
+        || lowerContentType.includes("application/problem+json")
+        || lowerContentType.includes("application/xml")
+        || lowerContentType.includes("application/x-www-form-urlencoded");
+
+    if (!canReadBody) {
+        return details;
+    }
+
+    try {
+        const bodyText = await response.clone().text();
+        details.bodyPreview = sanitizePreview(bodyText);
+        details.bodyHas429Signal = detect429Signal(bodyText);
+    } catch (error) {
+        details.bodyPreview = "[unavailable]";
+        details.bodyReadError = error instanceof Error ? error.message : String(error);
+    }
+
+    return details;
+}
+
+function buildSkippedTrace(trace, reason) {
+    return {
+        ...trace,
+        finalDecision: "skipped",
+        finalReason: reason,
+    };
+}
+
+async function recordAttempt(trace, response, phase, attemptNumber, retryTriggered, retryReason) {
+    const details = await inspectResponse(response);
+    trace.attempts.push({
+        attempt: attemptNumber,
+        phase,
+        ...details,
+        retryTriggered,
+        retryReason,
+    });
+}
+
+function commitTrace(trace, shouldLog) {
+    if (shouldLog) {
+        appendDebugLog(trace);
+    }
+}
+
+async function handleRetry(response, replayableRequest, originalFetch, thisArg, originalArgs, trace, shouldLog) {
     const settings = extension_settings[extensionName] ?? defaultSettings;
+    const initialShouldRetry = settings.enabled && response.status === 429;
+    if (shouldLog) {
+        await recordAttempt(trace, response, "initial", 0, initialShouldRetry, initialShouldRetry ? "http_429" : `http_status_${response.status}`);
+    }
 
     if (!settings.enabled || response.status !== 429) {
+        if (shouldLog) {
+            trace.finalDecision = settings.enabled ? "no_retry" : "disabled";
+            trace.finalReason = settings.enabled ? `response_status_${response.status}` : "auto_retry_disabled";
+            commitTrace(trace, shouldLog);
+        }
         return response;
     }
 
@@ -181,6 +586,10 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
 
     while (currentResponse.status === 429) {
         if (replayableRequest.signal?.aborted) {
+            trace.requestAborted = true;
+            trace.finalDecision = "stopped";
+            trace.finalReason = "request_aborted_before_retry";
+            commitTrace(trace, shouldLog);
             return currentResponse;
         }
 
@@ -189,6 +598,10 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
         }
 
         if (replayableRequest.signal?.aborted) {
+            trace.requestAborted = true;
+            trace.finalDecision = "stopped";
+            trace.finalReason = "request_aborted_after_wait";
+            commitTrace(trace, shouldLog);
             return currentResponse;
         }
 
@@ -197,13 +610,28 @@ async function handleRetry(response, replayableRequest, originalFetch, thisArg, 
         try {
             const retryArgs = createRetryArgs(originalArgs, replayableRequest);
             currentResponse = await originalFetch.apply(thisArg, retryArgs);
+            if (shouldLog) {
+                const shouldRetryAgain = currentResponse.status === 429;
+                await recordAttempt(trace, currentResponse, "retry", attemptNumber, shouldRetryAgain, shouldRetryAgain ? "http_429" : `http_status_${currentResponse.status}`);
+            }
             attemptNumber += 1;
         } catch (error) {
             console.warn(`[${extensionName}] Retry failed.`, error);
+            if (shouldLog) {
+                trace.errorMessage = error instanceof Error ? error.message : String(error);
+                trace.finalDecision = "retry_failed";
+                trace.finalReason = "network_or_wrapper_error";
+                commitTrace(trace, shouldLog);
+            }
             return currentResponse;
         }
     }
 
+    if (shouldLog) {
+        trace.finalDecision = attemptNumber > 1 ? "success_after_retry" : "success";
+        trace.finalReason = "received_non_429_response";
+        commitTrace(trace, shouldLog);
+    }
     return currentResponse;
 }
 
@@ -219,22 +647,56 @@ function installFetchInterceptor() {
             return window.__st_message_auto_retry_original_fetch__.apply(this, args);
         }
 
-        if (!isGenerationRequest(args[0])) {
+        const [input, init] = args;
+        const url = getRequestUrl(input);
+        const method = getRequestMethod(input, init);
+        const matchResult = classifyGenerationUrl(url);
+        const debugEnabled = isDebugEnabled();
+
+        if (!matchResult.matched) {
+            if (debugEnabled && isPotentialGenerationRequest(url, method)) {
+                appendDebugLog(buildSkippedTrace(buildTrace(args, matchResult), "url_not_matched"));
+            }
             return window.__st_message_auto_retry_original_fetch__.apply(this, args);
         }
 
         const replayableRequest = buildReplayableRequest(args);
         if (!replayableRequest) {
+            if (debugEnabled) {
+                appendDebugLog(buildSkippedTrace(buildTrace(args, matchResult), "request_not_replayable"));
+            }
             return window.__st_message_auto_retry_original_fetch__.apply(this, args);
         }
 
-        const response = await window.__st_message_auto_retry_original_fetch__.apply(this, args);
-        return handleRetry(response, replayableRequest, window.__st_message_auto_retry_original_fetch__, this, args);
+        const trace = buildTrace(args, matchResult);
+
+        try {
+            const response = await window.__st_message_auto_retry_original_fetch__.apply(this, args);
+            if (debugEnabled) {
+                return handleRetry(response, replayableRequest, window.__st_message_auto_retry_original_fetch__, this, args, trace, true);
+            }
+
+            const settings = extension_settings[extensionName] ?? defaultSettings;
+            if (!settings.enabled || response.status !== 429) {
+                return response;
+            }
+
+            return handleRetry(response, replayableRequest, window.__st_message_auto_retry_original_fetch__, this, args, trace, false);
+        } catch (error) {
+            if (debugEnabled) {
+                trace.errorMessage = error instanceof Error ? error.message : String(error);
+                trace.finalDecision = "request_failed";
+                trace.finalReason = "initial_fetch_error";
+                appendDebugLog(trace);
+            }
+            throw error;
+        }
     };
 }
 
 function init() {
     ensureSettings();
+    trimDebugLogs();
 
     void loadSettingsUi()
         .then(() => {
